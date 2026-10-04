@@ -40,9 +40,12 @@ app = FastAPI(
         "支持按撤销批次追查已交付归档凭据的影响面（冻结链命中本批被撤销证书的"
         "归档包与包内目标证书，分页输出）；"
         "支持按设备审计过去半开区间内的校准覆盖：按时间顺序返回完整、无重叠的"
-        "合规/空窗片段，合规片段列出当时可用的合格普通证书编号。"
+        "合规/空窗片段，合规片段列出当时可用的合格普通证书编号；"
+        "支持标准证书临时停用：计量人员凭管理密钥登记停用（仅生效证书），停用期间"
+        "新签发普通证书不得以该证书或其任何下游证书为追溯依据（单张与批次签发均校验），"
+        "复核后凭管理密钥解除，查询展示当前停用状态与历次停用/解除记录。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -88,6 +91,9 @@ def index():
             "GET  /api/v1/certificates/{cert_no}/chain",
             "GET  /api/v1/certificates/{cert_no}/downstream",
             "POST /api/v1/certificates/{cert_no}/revoke",
+            "POST /api/v1/certificates/{cert_no}/suspend",
+            "POST /api/v1/certificates/{cert_no}/lift-suspension",
+            "GET  /api/v1/certificates/{cert_no}/suspension",
             "POST /api/v1/correction-declarations",
             "GET  /api/v1/correction-declarations/{declaration_no}",
             "GET  /api/v1/certificates/{cert_no}/corrections",

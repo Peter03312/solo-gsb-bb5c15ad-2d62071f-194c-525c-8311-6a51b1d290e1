@@ -183,6 +183,30 @@ CREATE TABLE correction_declarations (
 );
 
 -- ----------------------------------------------------------------------------
+-- 标准证书临时停用表：计量人员发现标准证书有待复核时，凭管理密钥登记的
+-- 临时停用。停用自登记成功（事务提交）时刻起生效；停用期间新签发普通证书
+-- 不得以该证书或其任何下游证书为追溯依据（单张与交接批次签发均校验，
+-- 命中即拒绝并指出受阻证书与停用源）。复核后凭管理密钥登记解除：
+-- lifted_at/lifted_reason 由解除事务回填。每张证书至多一条生效中的停用
+-- （部分唯一索引强制，重复停用报冲突）；解除后历史行保留，可再次停用
+-- （新一行记录）。停用不改写证书内容、撤销状态与已冻结的交付快照。
+-- ----------------------------------------------------------------------------
+CREATE TABLE certificate_suspensions (
+    suspension_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    cert_no       TEXT NOT NULL REFERENCES certificates(cert_no), -- 被停用的证书
+    reason        TEXT NOT NULL,                 -- 停用原因（非空）
+    suspended_at  TIMESTAMPTZ NOT NULL DEFAULT now(), -- 停用登记时刻（生效起点）
+    lifted_reason TEXT,                          -- 解除原因（解除时回填）
+    lifted_at     TIMESTAMPTZ,                   -- 解除时刻；NULL 表示停用生效中
+    CHECK ((lifted_at IS NULL) = (lifted_reason IS NULL))
+);
+
+-- 每张证书至多一条生效中的停用（重复停用报冲突；解除后可再次停用）
+CREATE UNIQUE INDEX uq_certificate_suspensions_active
+    ON certificate_suspensions(cert_no) WHERE lifted_at IS NULL;
+CREATE INDEX idx_certificate_suspensions_cert ON certificate_suspensions(cert_no);
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。

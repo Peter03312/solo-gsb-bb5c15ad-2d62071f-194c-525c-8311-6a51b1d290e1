@@ -327,5 +327,42 @@ class DeliveryReceiptResponse(BaseModel):
     signed_at: datetime
 
 
+class SuspensionRequest(BaseModel):
+    """登记标准证书临时停用：非空停用原因。
+
+    计量人员发现标准证书有待复核时提交；须在 X-Management-Key 头中携带
+    本地配置的管理密钥。仅接受生效（ACTIVE）证书；停用自登记成功时刻起
+    生效，期间新签发普通证书不得以该证书或其任何下游证书为追溯依据。
+    """
+    reason: str = Field(..., min_length=1, max_length=1024, description="停用原因（非空白）")
+
+
+class SuspensionLiftRequest(BaseModel):
+    """解除临时停用：非空解除原因（须在 X-Management-Key 头携带管理密钥）。"""
+    reason: str = Field(..., min_length=1, max_length=1024, description="解除原因（非空白）")
+
+
+class SuspensionOut(BaseModel):
+    """一条停用记录：lifted_at 为 null 表示该停用当前生效中。"""
+    suspension_id: int
+    cert_no: str
+    reason: str = Field(..., description="停用原因")
+    suspended_at: datetime = Field(..., description="停用登记时刻（生效起点）")
+    lifted_reason: str | None = Field(None, description="解除原因（未解除为 null）")
+    lifted_at: datetime | None = Field(None, description="解除时刻（未解除为 null）")
+
+
+class SuspensionStatusOut(BaseModel):
+    """证书的停用视图：当前停用状态 + 历次停用/解除记录（按登记顺序）。"""
+    cert_no: str
+    suspended: bool = Field(..., description="当前是否处于生效停用中")
+    active_suspension: SuspensionOut | None = Field(
+        ..., description="当前生效的停用记录；无则为 null"
+    )
+    history: list[SuspensionOut] = Field(
+        ..., description="历次停用记录（含各次解除的时间与原因），按登记顺序升序"
+    )
+
+
 class ErrorBody(BaseModel):
     error: dict

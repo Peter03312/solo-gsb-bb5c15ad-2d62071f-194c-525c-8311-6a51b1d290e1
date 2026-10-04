@@ -15,6 +15,10 @@
 目标，定稿记录可凭管理密钥查询。
 面向监管与内审，还可按设备**审计过去半开区间内的校准覆盖**：按时间顺序还原
 完整、无重叠的合规与空窗片段，合规片段列出当时可用的合格普通证书编号。
+计量人员发现标准证书有待复核时，可凭管理密钥登记**临时停用**：停用自登记
+成功时刻起生效，期间新签发普通证书不得以该证书或其任何下游证书为追溯依据
+（单张与交接批次签发均校验，批内引用同样适用）；复核后凭管理密钥解除，
+查询可展示当前停用状态与历次停用、解除的时间和原因。
 
 - 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg3
 - 关键业务不变量由**数据库约束 + 触发器 + 单事务**保证，不依赖应用层“先查后写”，
@@ -89,7 +93,7 @@ docker compose down -v       # 停止并删除数据卷（下次启动重新初�
 | `POSTGRES_DB` | `caltrace` | 数据库名 |
 | `POSTGRES_PORT` | `127.0.0.1:5432` | 数据库在宿主机的绑定地址:端口 |
 | `DB_HOST` / `DB_PORT` | `db` / `5432` | API 容器内连接数据库用（compose 已固定） |
-| `DELIVERY_MANAGEMENT_KEY` | `caltrace-delivery-admin` | 交付方管理密钥：创建签收邀请、查询定稿记录经 `X-Management-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
+| `DELIVERY_MANAGEMENT_KEY` | `caltrace-delivery-admin` | 交付方管理密钥：创建签收邀请、查询定稿记录、登记/解除证书临时停用经 `X-Management-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
 
 ### 不用 Compose、直连已有 PostgreSQL
 
@@ -223,6 +227,23 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
       返回归档号、收件人、结论、拒收原因与签收时刻；密钥错误 `401`，
       归档包不存在 `404 archive_not_found`，归档包存在但尚未定稿
       `404 receipt_not_found`。
+14. **标准证书临时停用（待复核拦截）**：计量人员发现标准证书有待复核时，
+    凭现有管理密钥（`X-Management-Key` 头）登记临时停用（证书编号 + 非空
+    原因）。仅接受 `ACTIVE` 证书（已撤销/已失效 `409 cert_not_active`）；
+    停用自登记成功（事务提交）时刻起生效。停用期间，新签发普通证书不得
+    以该证书或其任何下游证书为追溯依据：单张签发与交接批次签发（含批内
+    引用）均校验被引用证书的完整上游链，命中生效停用即拒绝
+    （`422 reference_suspended`），错误详情指出受阻证书（`parent_cert_no`）
+    与停用源（`suspended_cert_no`），批次整批不落库。复核后凭管理密钥与
+    非空原因解除；重复停用（`409 suspension_conflict`）、无生效停用时解除
+    （`409 suspension_not_active`）均返回冲突。停用是可逆管理状态，**不改写**
+    既有证书内容、撤销状态与已冻结的交付快照；批次同键同内容重试仍返回
+    首次签发快照。停用、解除与并发签发按提交次序生效：停用事务锁定被停用
+    证书及其全部 ACTIVE 下游（与撤销相同的循环加锁），与签发事务对追溯
+    依据行的锁互斥——停用已提交后，任何引用受阻链的签发校验必被拦截；
+    签发先提交则其证书成为既有证书，不受停用影响。查询接口展示当前停用
+    状态及历次停用、解除的时间和原因（每张证书至多一条生效停用，由
+    部分唯一索引强制；解除后可再次停用，历次记录均保留）。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -783,6 +804,108 @@ curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001/
 密钥的 `GET /api/v1/delivery-archives/{archive_no}` 获取（既有语义不变）；
 定稿记录仅交付方凭管理密钥查询。
 
+### 19. 登记标准证书临时停用（计量人员，管理密钥）
+
+发现标准证书有待复核时，凭管理密钥登记临时停用（证书编号 + 非空原因）。
+仅接受生效（`ACTIVE`）证书；停用自登记成功时刻起生效：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspend \
+  -H 'Content-Type: application/json' \
+  -H 'X-Management-Key: caltrace-delivery-admin' \
+  -d '{"reason": "期间核查数据存疑，等待复核"}' | python3 -m json.tool
+```
+
+响应 `201`：
+
+```json
+{
+  "suspension": {
+    "suspension_id": 1,
+    "cert_no": "REF-MASTER-001",
+    "reason": "期间核查数据存疑，等待复核",
+    "suspended_at": "2026-10-04T02:10:00.123456+00:00",
+    "lifted_reason": null,
+    "lifted_at": null
+  }
+}
+```
+
+停用期间，新签发普通证书不得以该证书或其任何下游证书为追溯依据——
+单张签发（`POST /api/v1/certificates`）与交接批次签发
+（`POST /api/v1/certificate-batches`，含批内引用）均校验被引用证书的
+完整上游链，命中即拒绝并指出受阻证书与停用源（批次整批不落库）：
+
+```json
+{
+  "error": {
+    "code": "reference_suspended",
+    "message": "引用的标准证书 CAL-WS-001 的追溯链经过临时停用证书 REF-MASTER-001（停用原因：期间核查数据存疑，等待复核）；停用期间新签发证书不得以该证书或其任何下游证书为追溯依据",
+    "details": {
+      "parent_cert_no": "CAL-WS-001",
+      "suspended_cert_no": "REF-MASTER-001",
+      "suspension_reason": "期间核查数据存疑，等待复核",
+      "suspended_at": "2026-10-04T02:10:00.123456+00:00"
+    }
+  }
+}
+```
+
+拒绝场景：管理密钥缺失/错误 `401 invalid_management_key`；证书不存在
+`404 cert_not_found`；证书非生效（已撤销/已失效）`409 cert_not_active`；
+已有生效中的停用（重复停用）`409 suspension_conflict`；原因为空白
+`422 suspension_reason_required`。
+
+### 20. 解除临时停用（复核后，管理密钥）
+
+复核完成后凭管理密钥与非空原因解除当前生效的停用：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificates/REF-MASTER-001/lift-suspension \
+  -H 'Content-Type: application/json' \
+  -H 'X-Management-Key: caltrace-delivery-admin' \
+  -d '{"reason": "复核合格，恢复溯源使用"}' | python3 -m json.tool
+```
+
+响应 `200`，返回回填了解除时间与原因的停用记录；解除后该证书的下游链
+立即可重新作为追溯依据，且该证书可再次登记停用（新一条记录，历次记录
+均保留）。无生效停用时解除返回 `409 suspension_not_active`；解除原因为
+空白 `422 suspension_reason_required`。
+
+### 21. 查询证书停用状态与历史
+
+```bash
+curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspension | python3 -m json.tool
+```
+
+返回当前停用状态及历次停用、解除的时间和原因（按登记顺序）：
+
+```json
+{
+  "cert_no": "REF-MASTER-001",
+  "suspended": false,
+  "active_suspension": null,
+  "history": [
+    {
+      "suspension_id": 1,
+      "cert_no": "REF-MASTER-001",
+      "reason": "期间核查数据存疑，等待复核",
+      "suspended_at": "2026-10-04T02:10:00.123456+00:00",
+      "lifted_reason": "复核合格，恢复溯源使用",
+      "lifted_at": "2026-10-04T03:05:41.123456+00:00"
+    }
+  ]
+}
+```
+
+`suspended` 为当前是否处于生效停用中；`active_suspension` 为当前生效的
+停用记录（无则为 `null`）；`history` 列出全部历次停用（含各次解除时间
+与原因）。证书不存在返回 `404 cert_not_found`；从未停用的证书返回
+`suspended=false`、`active_suspension=null`、`history=[]`。
+
+> 停用是可逆管理状态：既有证书内容、撤销状态、已冻结的交付归档快照均不
+> 因停用/解除而改写；批次同键同内容重试仍返回首次签发快照。
+
 ---
 
 ## 错误响应
@@ -792,7 +915,7 @@ curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001/
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
 | 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` / `invitation_not_found` / `receipt_not_found` | 目标不存在（`receipt_not_found`：归档包存在但尚未定稿） |
-| 401 | `invalid_management_key` | 创建签收邀请或查询定稿记录时 `X-Management-Key` 缺失/错误 |
+| 401 | `invalid_management_key` | 创建签收邀请、查询定稿记录、登记/解除临时停用时 `X-Management-Key` 缺失/错误 |
 | 401 | `invalid_receipt_key` | 提交签收时一次性密钥错误 |
 | 409 | `cert_duplicate` | 证书编号已存在（含并发重复签发、批次与库内冲突） |
 | 409 | `batch_conflict` | 同一批次键提交了内容不同的签发请求 |
@@ -802,10 +925,15 @@ curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001/
 | 409 | `receipt_conflict` | 归档包已有定稿：不同内容重试或用其他邀请再提交（同邀请同内容重放返回首次结果） |
 | 409 | `invitation_expired` | 尚未定稿的邀请已过截止时刻（密钥正确也不能签收） |
 | 409 | `receipt_busy` | 签收与并发撤销竞争且死锁重试耗尽（防御性兜底，调用方可重试） |
+| 409 | `suspension_conflict` | 证书已存在生效中的临时停用（重复停用，含并发登记冲突） |
+| 409 | `suspension_not_active` | 解除临时停用时该证书无生效中的停用 |
+| 409 | `suspension_busy` | 停用登记与并发事务竞争且死锁重试耗尽（防御性兜底，调用方可重试） |
 | 422 | `invitation_deadline_past` | 创建邀请时截止时间不晚于当前时刻 |
 | 422 | `invitation_recipient_required` | 创建邀请时收件人为空白 |
 | 422 | `receipt_reason_required` | REJECT 未填写或仅空白的拒收原因 |
 | 422 | `receipt_targets_revoked` | ACCEPT 时包内目标或冻结追溯链中已有证书撤销/失效（`details.affected_targets` 点名受影响包内目标；REJECT 不受此限） |
+| 422 | `suspension_reason_required` | 登记/解除临时停用的原因为空或纯空白 |
+| 422 | `reference_suspended` | 签发引用的追溯链命中生效中的临时停用（`details.parent_cert_no` 受阻证书、`details.suspended_cert_no` 停用源；批次整批不落库） |
 | 422 | `archive_cert_duplicate` | 归档包内证书编号重复 |
 | 422 | `archive_not_deliverable` | 归档目标存在不达标项：不存在/非 CALIBRATION/目标或上游链非 ACTIVE/非 PASS（`details` 分类点名，整包未保存） |
 | 422 | `batch_cert_duplicate` | 批次内证书编号重复 |
@@ -820,7 +948,7 @@ curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001/
 | 422 | `reference_cycle` | 引用关系将形成环路（含批内成环） |
 | 422 | `validity_overlap` | 同设备已生效证书有效期重叠（含批内重叠） |
 | 409 | `validity_overlap_concurrent` | 并发签发重叠，排他约束兜底拒绝 |
-| 409 | `cert_not_active` | 撤销一张非 ACTIVE 证书 |
+| 409 | `cert_not_active` | 撤销或登记临时停用一张非 ACTIVE 证书 |
 | 422 | `invalid_audit_window` | 覆盖审计起止无效：缺时区/起点不早于终点/终点晚于查询时刻 |
 
 > 批次签发中由单条记录触发的校验错误与单张签发同码，并在 `details.cert_no`
@@ -841,6 +969,7 @@ python3 scripts/archive_checks.py     # 交付归档包：冻结快照/整包拒
 python3 scripts/impact_checks.py      # 撤销影响面：命中判定/序位/稳定分页/空页/并发提交次序
 python3 scripts/receipt_checks.py     # 交付签收：邀请一次性密钥/截止/定稿幂等冲突/撤销拦截/并发次序
 python3 scripts/coverage_checks.py    # 覆盖审计：计入窗口/撤销与级联截断/重签还原/空窗/参数错误
+python3 scripts/suspension_checks.py  # 临时停用：登记/解除/查询/签发拦截（单张+批次+批内）/并发次序
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
@@ -884,4 +1013,15 @@ ACCEPT 且不被随后撤销改写，先撤销则 ACCEPT 422 且不留定稿）�
 覆盖、未来生效/签发时已过期/不合格/基准证书均不提供覆盖、未知设备
 整段空窗、子区间端点裁剪、片段完整无重叠且相邻不重复、不同时区表示
 同一时刻结果一致、起止无效/缺时区/终点晚于查询时刻报
-`422 invalid_audit_window`，以及既有证书/设备历史/撤销响应契约不变。
+`422 invalid_audit_window`，以及既有证书/设备历史/撤销响应契约不变；
+标准证书临时停用的管理密钥校验（缺失/错误 401）、证书不存在 404、
+非生效证书 409、原因空白 422、重复停用 409，停用期间单张签发直接/
+间接引用受阻链均 422 并点名受阻证书与停用源、未停用链不受影响，
+批次签发引用库内停用链与批内传递引用均整批拒绝且不落库
+（`details.cert_no` 定位出错编号）、停用后同键同内容批次重放仍返回
+首次快照，解除的无生效停用 409/原因空白 422/解除后签发恢复/再次停用
+生成新记录，查询视图的当前状态与历次停用/解除时间原因（含从未停用
+与不存在证书），停用不改写证书内容/撤销状态/已冻结交付快照、停用中
+证书仍可撤销且停用记录保留，以及并发次序（8 组链停用×签发同时提交：
+停用均已提交后引用受阻链的签发必被 422 拦截、同证书 5 线程并发停用
+仅 1 次 201 其余 409、5 线程并发解除仅 1 次 200 其余 409）。

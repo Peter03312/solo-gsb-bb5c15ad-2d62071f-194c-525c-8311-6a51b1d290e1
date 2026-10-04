@@ -72,6 +72,21 @@ CREATE TABLE IF NOT EXISTS delivery_receipts (
 );
 """,
     """
+CREATE TABLE IF NOT EXISTS certificate_suspensions (
+    suspension_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    cert_no       TEXT NOT NULL REFERENCES certificates(cert_no),
+    reason        TEXT NOT NULL,
+    suspended_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lifted_reason TEXT,
+    lifted_at     TIMESTAMPTZ,
+    CHECK ((lifted_at IS NULL) = (lifted_reason IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_certificate_suspensions_active
+    ON certificate_suspensions(cert_no) WHERE lifted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_certificate_suspensions_cert
+    ON certificate_suspensions(cert_no);
+""",
+    """
 CREATE OR REPLACE FUNCTION append_only_sealed() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION '% is append-only and sealed (trigger=%)', TG_TABLE_NAME, TG_NAME

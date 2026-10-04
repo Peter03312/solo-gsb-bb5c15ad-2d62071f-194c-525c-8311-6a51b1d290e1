@@ -10,6 +10,9 @@
 - GET    /api/v1/certificates/{cert_no}/chain  完整追溯引用链
 - GET    /api/v1/certificates/{cert_no}/downstream  全部下游证书（影响面预览）
 - POST   /api/v1/certificates/{cert_no}/revoke 撤销证书并级联失效下游
+- POST   /api/v1/certificates/{cert_no}/suspend 登记标准证书临时停用（管理密钥）
+- POST   /api/v1/certificates/{cert_no}/lift-suspension  解除临时停用（管理密钥）
+- GET    /api/v1/certificates/{cert_no}/suspension  证书停用状态与历次停用/解除记录
 - POST   /api/v1/correction-declarations       登记更正声明（展示字段纠错，声明编号幂等）
 - GET    /api/v1/correction-declarations/{declaration_no}  按声明编号查询
 - GET    /api/v1/certificates/{cert_no}/corrections  证书更正视图（声明历史+合并展示）
@@ -42,6 +45,8 @@ from .schemas import (
     DeliveryReceiptResponse,
     ReferenceIssueRequest,
     RevokeRequest,
+    SuspensionLiftRequest,
+    SuspensionRequest,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -119,6 +124,55 @@ def revoke_certificate(
 ):
     with pool.connection() as conn:
         return repo.revoke_certificate(conn, cert_no, req.reason, req.operator)
+
+
+@router.post("/certificates/{cert_no}/suspend", status_code=201)
+def suspend_certificate(
+    cert_no: str,
+    req: SuspensionRequest,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="交付方本地配置的管理密钥",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """登记标准证书临时停用（待复核拦截）：仅接受生效（ACTIVE）证书，
+    停用自登记成功时刻起生效。停用期间新签发普通证书不得以该证书或其
+    任何下游证书为追溯依据（单张与交接批次签发均校验）。
+
+    管理密钥缺失/错误 401 invalid_management_key、证书不存在 404、
+    证书非生效 409 cert_not_active、重复停用 409 suspension_conflict、
+    原因空白 422 suspension_reason_required。
+    """
+    with pool.connection() as conn:
+        return repo.suspend_certificate(conn, cert_no, req.reason, x_management_key)
+
+
+@router.post("/certificates/{cert_no}/lift-suspension", status_code=200)
+def lift_certificate_suspension(
+    cert_no: str,
+    req: SuspensionLiftRequest,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="交付方本地配置的管理密钥",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """复核后解除证书当前生效的临时停用（管理密钥 + 非空原因）。
+
+    无生效停用时解除 409 suspension_not_active；解除后该证书可再次登记停用。
+    """
+    with pool.connection() as conn:
+        return repo.lift_suspension(conn, cert_no, req.reason, x_management_key)
+
+
+@router.get("/certificates/{cert_no}/suspension")
+def get_certificate_suspension(cert_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """证书的停用视图：当前停用状态及历次停用、解除的时间和原因（按登记顺序）。"""
+    with pool.connection() as conn:
+        return repo.get_certificate_suspension(conn, cert_no)
 
 
 @router.post("/correction-declarations", status_code=201)
