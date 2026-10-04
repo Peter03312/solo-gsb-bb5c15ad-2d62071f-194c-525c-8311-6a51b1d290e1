@@ -115,6 +115,18 @@ class BatchIssueRequest(BaseModel):
     )
 
 
+class CertificateSuspensionRequest(BaseModel):
+    """登记/解除标准证书临时停用：管理密钥经 X-Management-Key 头校验（非 body）。
+
+    登记停用：证书必须存在且当前为生效（ACTIVE）证书，原因非空白；
+    同一张证书重复停用（已有生效中的停用记录）报 409 suspension_conflict。
+    解除停用：原因非空白；没有生效中的停用记录时报 409 suspension_not_active。
+    停用从登记成功（事务提交）时刻起生效，不改变证书自身状态与内容。
+    """
+    cert_no: str = Field(..., min_length=1, max_length=128, description="被停用/解除停用的标准证书编号")
+    reason: str = Field(..., max_length=1024, description="停用原因（登记停用）或复核解除原因（解除停用），均须非空")
+
+
 class DeliveryArchiveRequest(BaseModel):
     """客户交付归档：归档包编号 + 非空目标证书编号列表（顺序即交付顺序）。
 
@@ -325,6 +337,37 @@ class DeliveryReceiptResponse(BaseModel):
     decision: Literal["ACCEPT", "REJECT"]
     reason: str | None = None
     signed_at: datetime
+
+
+class SuspensionEventOut(BaseModel):
+    """一次停用/解除事件（停用登记或复核解除，按登记时间升序）。"""
+    suspension_id: int
+    action: Literal["SUSPEND", "LIFT"] = Field(
+        ..., description="SUSPEND=登记停用；LIFT=复核后解除停用"
+    )
+    reason: str = Field(..., description="停用原因或解除原因（各自非空）")
+    at: datetime = Field(..., description="停用登记时刻（停用从该时刻起生效）或解除时刻")
+    lifted_at: datetime | None = Field(
+        None, description="停用记录上的解除时刻（action=LIFT 时等于 at；SUSPEND 时为空）"
+    )
+    lift_reason: str | None = Field(None, description="停用记录上的解除原因（action=SUSPEND 时为空）")
+
+
+class CertificateSuspensionOut(BaseModel):
+    """证书停用状态视图：当前状态 + 历次停用/解除的时间与原因。"""
+    cert_no: str
+    certificate: CertificateOut = Field(
+        ..., description="证书当前内容（停用不改写：状态仍为其自身 ACTIVE/REVOKED/INVALID）"
+    )
+    currently_suspended: bool = Field(
+        ..., description="是否存在生效中的停用记录（与证书自身状态相互独立）"
+    )
+    active: SuspensionEventOut | None = Field(
+        None, description="当前生效中的停用事件；无生效停用时为 null"
+    )
+    history: list[SuspensionEventOut] = Field(
+        ..., description="历次停用/解除事件，按登记时间（suspension_id）升序；每次停用随后可能有一次解除"
+    )
 
 
 class ErrorBody(BaseModel):

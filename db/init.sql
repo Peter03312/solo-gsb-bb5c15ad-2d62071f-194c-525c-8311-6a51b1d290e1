@@ -183,6 +183,33 @@ CREATE TABLE correction_declarations (
 );
 
 -- ----------------------------------------------------------------------------
+-- 标准证书临时停用表：计量人员发现标准证书有待复核时，凭管理密钥登记临时停用，
+-- 停用期间该证书及其任何下游证书均不得作为新签发普通证书的追溯依据；复核后凭
+-- 管理密钥登记解除。每次登记一行，解除不删行、不另建表：lifted_at/lift_reason
+-- 在解除事务中一次性写入（触发器强制，写入后不可再改）。部分唯一索引保证同一
+-- 证书至多存在一条“生效中”（lifted_at IS NULL）的停用记录。
+-- 本表不触碰 certificates：证书内容与 ACTIVE/REVOKED/INVALID 状态不因停用改写。
+-- ----------------------------------------------------------------------------
+CREATE TABLE cert_suspensions (
+    suspension_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    cert_no       TEXT NOT NULL REFERENCES certificates(cert_no), -- 被停用的标准证书
+    reason        TEXT NOT NULL,                                 -- 停用原因（非空）
+    suspended_at  TIMESTAMPTZ NOT NULL DEFAULT now(),           -- 停用登记成功时刻（即生效时刻）
+    lifted_at     TIMESTAMPTZ,                                  -- 解除时刻；NULL 表示停用生效中
+    lift_reason   TEXT,                                          -- 解除原因（解除时非空）
+    CONSTRAINT cert_suspension_lift_metadata
+        CHECK (lifted_at IS NULL OR
+               (lift_reason IS NOT NULL AND lifted_at >= suspended_at))
+);
+
+CREATE INDEX idx_cert_suspensions_cert
+    ON cert_suspensions(cert_no, suspension_id);
+
+-- 同一证书至多一条生效中的停用记录：重复停用由数据库兜底判冲突
+CREATE UNIQUE INDEX idx_cert_suspensions_one_active
+    ON cert_suspensions(cert_no) WHERE (lifted_at IS NULL);
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。
@@ -277,6 +304,34 @@ CREATE TRIGGER trg_delivery_receipts_no_update
 CREATE TRIGGER trg_delivery_receipts_no_delete
     BEFORE DELETE ON delivery_receipts
     FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+-- 停用记录仅允许“解除停用”这一次性 UPDATE：从生效中（lifted_at 为 NULL）
+-- 变为已解除（lifted_at/lift_reason 写入），其余列一律不可改；DELETE 禁止。
+CREATE OR REPLACE FUNCTION cert_suspensions_lift_only() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'cert_suspensions is append-only: %', OLD.cert_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.lifted_at IS NOT NULL
+       OR NEW.lifted_at IS NULL
+       OR NEW.lift_reason IS NULL
+       OR NEW.suspension_id IS DISTINCT FROM OLD.suspension_id
+       OR NEW.cert_no       IS DISTINCT FROM OLD.cert_no
+       OR NEW.reason        IS DISTINCT FROM OLD.reason
+       OR NEW.suspended_at  IS DISTINCT FROM OLD.suspended_at
+    THEN
+        RAISE EXCEPTION 'cert_suspensions rows can only be lifted once (suspension_id=%)',
+            OLD.suspension_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_cert_suspensions_lift_only
+    BEFORE UPDATE OR DELETE ON cert_suspensions
+    FOR EACH ROW EXECUTE FUNCTION cert_suspensions_lift_only();
 
 -- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层

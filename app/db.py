@@ -72,6 +72,51 @@ CREATE TABLE IF NOT EXISTS delivery_receipts (
 );
 """,
     """
+CREATE TABLE IF NOT EXISTS cert_suspensions (
+    suspension_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    cert_no       TEXT NOT NULL REFERENCES certificates(cert_no),
+    reason        TEXT NOT NULL,
+    suspended_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lifted_at     TIMESTAMPTZ,
+    lift_reason   TEXT,
+    CONSTRAINT cert_suspension_lift_metadata
+        CHECK (lifted_at IS NULL OR
+               (lift_reason IS NOT NULL AND lifted_at >= suspended_at))
+);
+CREATE INDEX IF NOT EXISTS idx_cert_suspensions_cert
+    ON cert_suspensions(cert_no, suspension_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cert_suspensions_one_active
+    ON cert_suspensions(cert_no) WHERE (lifted_at IS NULL);
+""",
+    """
+CREATE OR REPLACE FUNCTION cert_suspensions_lift_only() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'cert_suspensions is append-only: %', OLD.cert_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.lifted_at IS NOT NULL
+       OR NEW.lifted_at IS NULL
+       OR NEW.lift_reason IS NULL
+       OR NEW.suspension_id IS DISTINCT FROM OLD.suspension_id
+       OR NEW.cert_no       IS DISTINCT FROM OLD.cert_no
+       OR NEW.reason        IS DISTINCT FROM OLD.reason
+       OR NEW.suspended_at  IS DISTINCT FROM OLD.suspended_at
+    THEN
+        RAISE EXCEPTION 'cert_suspensions rows can only be lifted once (suspension_id=%)',
+            OLD.suspension_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_cert_suspensions_lift_only
+    BEFORE UPDATE OR DELETE ON cert_suspensions
+    FOR EACH ROW EXECUTE FUNCTION cert_suspensions_lift_only();
+""",
+    """
 CREATE OR REPLACE FUNCTION append_only_sealed() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION '% is append-only and sealed (trigger=%)', TG_TABLE_NAME, TG_NAME

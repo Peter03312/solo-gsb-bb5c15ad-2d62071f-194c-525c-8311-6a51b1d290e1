@@ -142,8 +142,76 @@ def get_downstream(conn, cert_no: str) -> dict:
 # 证书签发
 # ---------------------------------------------------------------------------
 
-def _validate_parent(conn, parent_no: str, calibrated_at) -> dict:
+def _lock_parent_chain_share(conn, parent_no: str) -> None:
+    """对被引用证书的完整上游链按“追溯起点→下游”顺序加 FOR SHARE 行锁。
+
+    用于签发事务在读取“停用受阻链”之前与停用登记/解除事务（对同链证书
+    持有 FOR UPDATE）串行化：停用已提交则随后的检查必见，停用尚未提交则
+    被阻塞到签发提交之后，二者按实际提交次序生效，不存在混用时点或等待环
+    （加锁顺序与撤销/停用/交付事务的链上加锁顺序一致）。
+    """
+    conn.execute(
+        """
+        WITH RECURSIVE walk AS (
+            SELECT cert_no, parent_cert_no, 0 AS depth
+            FROM certificates WHERE cert_no = %s
+            UNION ALL
+            SELECT c.cert_no, c.parent_cert_no, w.depth - 1
+            FROM certificates c JOIN walk w ON c.cert_no = w.parent_cert_no
+        )
+        CYCLE cert_no SET is_cycle USING cycle_path
+        SELECT c.cert_no
+        FROM certificates c
+        JOIN walk w ON w.cert_no = c.cert_no
+        WHERE NOT w.is_cycle
+        ORDER BY w.depth ASC, c.cert_no ASC
+        FOR SHARE OF c
+        """,
+        (parent_no,),
+    ).fetchall()
+
+
+def _suspension_blocker(conn, parent_no: str, new_cert_no: str | None = None) -> dict | None:
+    """被引用的标准证书（或其任一上游）若存在生效中的停用记录，返回受阻信息。
+
+    命中时返回 blocked_cert_no（被引用的受阻证书，即直接 parent_no）、
+    suspension_source（最近停用源证书编号）、suspension_id。调用方须已对
+    完整上游链持有 FOR SHARE 锁（见 _lock_parent_chain_share）。
+    """
+    row = conn.execute(
+        """
+        WITH RECURSIVE walk AS (
+            SELECT cert_no, parent_cert_no, 0 AS depth
+            FROM certificates WHERE cert_no = %s
+            UNION ALL
+            SELECT c.cert_no, c.parent_cert_no, w.depth - 1
+            FROM certificates c JOIN walk w ON c.cert_no = w.parent_cert_no
+        )
+        CYCLE cert_no SET is_cycle USING cycle_path
+        SELECT s.suspension_id, s.cert_no AS source_cert_no
+        FROM cert_suspensions s
+        JOIN walk w ON w.cert_no = s.cert_no
+        WHERE NOT w.is_cycle AND s.lifted_at IS NULL
+        ORDER BY w.depth DESC, s.suspended_at DESC, s.suspension_id DESC
+        LIMIT 1
+        """,
+        (parent_no,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "blocked_cert_no": parent_no,
+        "suspension_source": row["source_cert_no"],
+        "suspension_id": row["suspension_id"],
+        "new_cert_no": new_cert_no,
+    }
+
+
+def _validate_parent(
+    conn, parent_no: str, calibrated_at, new_cert_no: str | None = None
+) -> dict:
     """被引用的标准设备证书：必须存在、生效中、合格，且校准时刻落在有效期内。"""
+    _lock_parent_chain_share(conn, parent_no)
     parent = _get_cert_row(conn, parent_no, lock=True)
     if parent is None:
         raise ApiError(422, "invalid_reference", f"引用的标准证书不存在: {parent_no}")
@@ -153,6 +221,18 @@ def _validate_parent(conn, parent_no: str, calibrated_at) -> dict:
             "reference_not_active",
             f"引用的标准证书 {parent_no} 当前状态为 {parent['status']}，"
             "已撤销/失效证书不得作为校准依据",
+        )
+    blocker = _suspension_blocker(conn, parent_no, new_cert_no)
+    if blocker is not None:
+        details = {k: v for k, v in blocker.items() if v is not None}
+        if new_cert_no is not None:
+            details["cert_no"] = new_cert_no
+        raise ApiError(
+            422,
+            "reference_suspended",
+            f"证书 {parent_no} 处于临时停用中（停用源：{blocker['suspension_source']}）"
+            "或其追溯链上游存在停用标准证书，停用期间不得作为新签发证书的追溯依据",
+            details=details,
         )
     if parent["conclusion"] != "PASS":
         raise ApiError(
@@ -254,18 +334,40 @@ def _insert_certificate(conn, *, kind: str, conclusion: str, parent_no: str | No
     return get_certificate(conn, req.cert_no)
 
 
-def issue_certificate(conn, req) -> dict:
-    """签发普通校准证书。"""
+def _issue_certificate_once(conn, req) -> dict:
     with conn.transaction():
-        _validate_parent(conn, req.parent_cert_no, req.calibrated_at)
+        _validate_parent(conn, req.parent_cert_no, req.calibrated_at, req.cert_no)
         _assert_no_cycle(conn, req.parent_cert_no, req.cert_no)
         _assert_no_overlap(conn, req.device_id, req.valid_from, req.valid_to, req.cert_no)
         cert = _insert_certificate(
             conn, kind="CALIBRATION", conclusion=req.conclusion,
             parent_no=req.parent_cert_no, req=req,
         )
-    chain = get_chain(conn, req.cert_no)
-    return {"certificate": cert, "chain": chain}
+    return {"certificate": cert, "chain": get_chain(conn, req.cert_no)}
+
+
+def issue_certificate(conn, req) -> dict:
+    """签发普通校准证书。
+
+    停用/解除/撤销事务在追溯链上持 FOR UPDATE/FOR SHARE 锁，与并发签发的
+    链上锁可能形成被死锁检测终止的等待环：检测到死锁后整体重试（重试事务
+    按已提交的停用状态判定），耗尽则 409 issuance_busy（调用方可重试）。
+    """
+    try:
+        return _issue_certificate_once(conn, req)
+    except psycopg.errors.DeadlockDetected:
+        try:
+            return _issue_certificate_once(conn, req)
+        except psycopg.errors.DeadlockDetected:
+            try:
+                return _issue_certificate_once(conn, req)
+            except psycopg.errors.DeadlockDetected:
+                raise ApiError(
+                    409,
+                    "issuance_busy",
+                    f"证书 {req.cert_no} 的签发与并发停用/撤销竞争，重试后仍冲突，请稍后重试",
+                    details={"cert_no": req.cert_no},
+                )
 
 
 def issue_reference(conn, req) -> dict:
@@ -445,7 +547,7 @@ def _insert_batch_items(conn, ordered: list) -> None:
     for it in ordered:
         try:
             if it.kind == "CALIBRATION":
-                _validate_parent(conn, it.parent_cert_no, it.calibrated_at)
+                _validate_parent(conn, it.parent_cert_no, it.calibrated_at, it.cert_no)
             _assert_no_overlap(
                 conn, it.device_id, it.valid_from, it.valid_to, it.cert_no
             )
@@ -538,45 +640,61 @@ def issue_batch(conn, req) -> tuple[dict, bool]:
     - 与单张签发、撤销并发时，沿用同一套行锁、唯一约束与排他约束，规则一致。
     """
     req_hash, request_doc = _canonical_request(req)
-    try:
-        with conn.transaction():
+    for attempt in range(3):
+        try:
+            return _issue_batch_once(conn, req, req_hash, request_doc)
+        except psycopg.errors.DeadlockDetected:
+            # 与并发停用/解除/撤销在引用链上的加锁等待环由死锁检测终止，整体重试
+            if attempt == 2:
+                raise ApiError(
+                    409,
+                    "issuance_busy",
+                    f"批次 {req.batch_key} 的签发与并发停用/撤销竞争，重试后仍冲突，"
+                    "整批未签发，请稍后重试",
+                    details={"batch_key": req.batch_key},
+                )
+        except psycopg.errors.UniqueViolation:
+            # 事务已整体回滚：并发同键提交，或与并发事务的证书编号冲突
             existing = _get_issue_batch_row(conn, req.batch_key)
             if existing is not None:
                 return _replay_or_conflict(existing, req.batch_key, req_hash), False
-            ordered = _validate_batch(conn, req)
-            _insert_batch_items(conn, ordered)
-            issued_at = datetime.now(timezone.utc)
-            response = _build_batch_response(conn, req, issued_at)
-            conn.execute(
-                """
-                INSERT INTO issue_batches
-                    (batch_key, request_hash, request, response, cert_nos, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    req.batch_key,
-                    req_hash,
-                    Jsonb(request_doc),
-                    Jsonb(response, dumps=_json_dumps),
-                    [it.cert_no for it in req.certificates],
-                    issued_at,
-                ),
+            raise _batch_cert_duplicate_error(conn, req)
+        except psycopg.errors.ExclusionViolation:
+            raise _batch_overlap_error(conn, req)
+        except psycopg.errors.ForeignKeyViolation:
+            raise ApiError(
+                422, "invalid_reference", "引用的标准证书不存在（并发变更），整批未签发"
             )
-            return response, True
-    except psycopg.errors.UniqueViolation:
-        # 事务已整体回滚：并发同键提交，或与并发事务的证书编号冲突
+        except psycopg.errors.CheckViolation as exc:
+            raise ApiError(422, "rule_violation", f"签发被数据库完整性规则拒绝: {exc}")
+    raise ApiError(409, "issuance_busy", f"批次 {req.batch_key} 签发重试耗尽，整批未签发")
+
+
+def _issue_batch_once(conn, req, req_hash: str, request_doc: dict) -> tuple[dict, bool]:
+    with conn.transaction():
         existing = _get_issue_batch_row(conn, req.batch_key)
         if existing is not None:
             return _replay_or_conflict(existing, req.batch_key, req_hash), False
-        raise _batch_cert_duplicate_error(conn, req)
-    except psycopg.errors.ExclusionViolation:
-        raise _batch_overlap_error(conn, req)
-    except psycopg.errors.ForeignKeyViolation:
-        raise ApiError(
-            422, "invalid_reference", "引用的标准证书不存在（并发变更），整批未签发"
+        ordered = _validate_batch(conn, req)
+        _insert_batch_items(conn, ordered)
+        issued_at = datetime.now(timezone.utc)
+        response = _build_batch_response(conn, req, issued_at)
+        conn.execute(
+            """
+            INSERT INTO issue_batches
+                (batch_key, request_hash, request, response, cert_nos, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                req.batch_key,
+                req_hash,
+                Jsonb(request_doc),
+                Jsonb(response, dumps=_json_dumps),
+                [it.cert_no for it in req.certificates],
+                issued_at,
+            ),
         )
-    except psycopg.errors.CheckViolation as exc:
-        raise ApiError(422, "rule_violation", f"签发被数据库完整性规则拒绝: {exc}")
+        return response, True
 
 
 def get_issue_batch(conn, batch_key: str) -> dict:
@@ -1695,6 +1813,253 @@ def get_revocation_archive_impact(conn, batch_id: int, limit: int, offset: int) 
         "offset": offset,
         "items": items,
     }
+
+
+# ---------------------------------------------------------------------------
+# 标准证书临时停用（待复核）与解除：停用期间该证书及任何下游证书不得作为
+# 新签发普通证书的追溯依据。停用/解除不触碰 certificates 表——证书内容、
+# ACTIVE/REVOKED/INVALID 状态、已冻结的交付归档快照均不因停用改写。
+# ---------------------------------------------------------------------------
+
+_SUSPENSION_COLS = "suspension_id, cert_no, reason, suspended_at, lifted_at, lift_reason"
+
+
+def _active_suspension_row(conn, cert_no: str) -> dict | None:
+    return conn.execute(
+        f"SELECT {_SUSPENSION_COLS} FROM cert_suspensions "
+        "WHERE cert_no = %s AND lifted_at IS NULL LIMIT 1",
+        (cert_no,),
+    ).fetchone()
+
+
+def _gather_active_descendants_nos(conn, cert_no: str) -> list[str]:
+    """当前所有直接/间接下游证书编号（含已撤销/失效者，仅用于加锁范围）。"""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE d AS (
+            SELECT cert_no FROM certificates WHERE parent_cert_no = %s
+            UNION ALL
+            SELECT c.cert_no
+            FROM certificates c JOIN d ON c.parent_cert_no = d.cert_no
+        )
+        CYCLE cert_no SET is_cycle USING cycle_path
+        SELECT cert_no FROM d WHERE NOT is_cycle
+        """,
+        (cert_no,),
+    ).fetchall()
+    return sorted(r["cert_no"] for r in rows)
+
+
+def _suspension_event(row: dict) -> dict:
+    """一行停用记录展开为时间线事件。"""
+    events = [
+        {
+            "suspension_id": row["suspension_id"],
+            "action": "SUSPEND",
+            "reason": row["reason"],
+            "at": row["suspended_at"],
+            "lifted_at": None,
+            "lift_reason": None,
+        }
+    ]
+    if row["lifted_at"] is not None:
+        events.append(
+            {
+                "suspension_id": row["suspension_id"],
+                "action": "LIFT",
+                "reason": row["lift_reason"],
+                "at": row["lifted_at"],
+                "lifted_at": row["lifted_at"],
+                "lift_reason": row["lift_reason"],
+            }
+        )
+    return events
+
+
+def _suspension_view(conn, cert_no: str) -> dict:
+    certificate = get_certificate(conn, cert_no)
+    rows = conn.execute(
+        f"SELECT {_SUSPENSION_COLS} FROM cert_suspensions "
+        "WHERE cert_no = %s ORDER BY suspension_id ASC",
+        (cert_no,),
+    ).fetchall()
+    history: list[dict] = []
+    active_event = None
+    for row in rows:
+        events = _suspension_event(row)
+        if row["lifted_at"] is None:
+            active_event = events[0]
+        history.extend(events)
+    return {
+        "cert_no": cert_no,
+        "certificate": certificate,
+        "currently_suspended": active_event is not None,
+        "active": active_event,
+        "history": history,
+    }
+
+
+def suspend_certificate(conn, cert_no: str, reason: str, management_key: str | None) -> dict:
+    """登记标准证书临时停用（待复核）。
+
+    - 管理密钥经 X-Management-Key 头校验（与交付管理共用同一把本地密钥）；
+      密钥缺失/错误 → 401 invalid_management_key；
+    - 只接受生效证书：证书不存在 → 404 cert_not_found；证书非 ACTIVE
+      （已撤销/失效）→ 409 cert_not_active；
+    - 原因必须非空白 → 422 suspension_reason_required；
+    - 重复停用（已有生效中的停用记录）→ 409 suspension_conflict；
+    - 停用从登记成功（事务提交）时刻起生效：先对被停用证书加 FOR UPDATE，
+      再按编号排序锁定其全部当前下游，并经部分唯一索引兜底；并发签发事务
+      对上游链持 FOR SHARE 锁，停用提交前无法插入引用该链的新证书，
+      停用提交后其受阻检查必见本记录——按实际提交次序生效。
+    """
+    _require_management_key(management_key)
+    if not reason or not reason.strip():
+        raise ApiError(422, "suspension_reason_required", "停用原因不能为空")
+    reason = reason.strip()
+    try:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT cert_no, status FROM certificates WHERE cert_no = %s FOR UPDATE",
+                (cert_no,),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "cert_not_found", f"证书不存在: {cert_no}")
+            if row["status"] != "ACTIVE":
+                raise ApiError(
+                    409,
+                    "cert_not_active",
+                    f"证书 {cert_no} 当前状态为 {row['status']}，仅生效中的证书可登记停用",
+                    details={"cert_no": cert_no, "status": row["status"]},
+                )
+            if _active_suspension_row(conn, cert_no) is not None:
+                raise ApiError(
+                    409,
+                    "suspension_conflict",
+                    f"证书 {cert_no} 已存在生效中的临时停用记录，不能重复停用；"
+                    "请先复核并解除停用",
+                    details={"cert_no": cert_no},
+                )
+            # 与撤销事务相同的防御性下游收集循环：收集→锁定→再收集，直到集合
+            # 不再扩大，覆盖“停用进行中恰有下游证书提交”的竞态。
+            locked: set[str] = set()
+            while True:
+                fresh = [no for no in _gather_active_descendants_nos(conn, cert_no)
+                         if no not in locked]
+                if not fresh:
+                    break
+                conn.execute(
+                    "SELECT cert_no FROM certificates "
+                    "WHERE cert_no = ANY(%s) ORDER BY cert_no FOR UPDATE",
+                    (fresh,),
+                ).fetchall()
+                locked.update(fresh)
+            suspended = conn.execute(
+                "INSERT INTO cert_suspensions (cert_no, reason) "
+                "VALUES (%s, %s) RETURNING " + _SUSPENSION_COLS,
+                (cert_no, reason),
+            ).fetchone()
+    except psycopg.errors.UniqueViolation:
+        # 并发停用同一证书：部分唯一索引兜底，后到事务回滚后按冲突处理
+        existing = _active_suspension_row(conn, cert_no)
+        if existing is not None:
+            raise ApiError(
+                409,
+                "suspension_conflict",
+                f"证书 {cert_no} 已存在生效中的临时停用记录（并发登记），不能重复停用",
+                details={"cert_no": cert_no, "suspension_id": existing["suspension_id"]},
+            )
+        raise ApiError(
+            409,
+            "cert_not_active",
+            f"证书 {cert_no} 当前不是生效状态（并发变更），仅生效中的证书可登记停用",
+            details={"cert_no": cert_no},
+        )
+    except psycopg.errors.DeadlockDetected:
+        raise ApiError(
+            409,
+            "suspension_busy",
+            f"证书 {cert_no} 的停用登记与并发签发/撤销竞争，重试后仍冲突，请稍后重试",
+            details={"cert_no": cert_no},
+        )
+    body = _suspension_view(conn, cert_no)
+    body["suspension"] = _suspension_event(suspended)[0]
+    return body
+
+
+def lift_certificate(conn, cert_no: str, reason: str, management_key: str | None) -> dict:
+    """复核后解除标准证书临时停用。
+
+    - 管理密钥缺失/错误 → 401；解除原因非空白 → 422 suspension_reason_required；
+    - 证书不存在 → 404 cert_not_found；无生效中的停用记录（重复解除）→
+      409 suspension_not_active；
+    - 解除事务先对被停用证书的完整链（根→目标顺序）加 FOR SHARE，再锁定
+      生效停用记录行（FOR UPDATE），与并发签发的链上 SHARE 锁按提交次序
+      判定：解除先提交则受阻检查放行，签发先提交则被阻塞到解除提交之后；
+    - 停用/解除记录只增不改（触发器强制解除字段一次性写入）。
+    """
+    _require_management_key(management_key)
+    if not reason or not reason.strip():
+        raise ApiError(422, "suspension_reason_required", "解除停用原因不能为空")
+    reason = reason.strip()
+    for attempt in range(3):
+        try:
+            with conn.transaction():
+                cert = conn.execute(
+                    "SELECT 1 FROM certificates WHERE cert_no = %s", (cert_no,)
+                ).fetchone()
+                if cert is None:
+                    raise ApiError(404, "cert_not_found", f"证书不存在: {cert_no}")
+                active = _active_suspension_row(conn, cert_no)
+                if active is None:
+                    raise ApiError(
+                        409,
+                        "suspension_not_active",
+                        f"证书 {cert_no} 没有生效中的临时停用记录，无需解除（不能重复解除）",
+                        details={"cert_no": cert_no},
+                    )
+                # 与并发签发按提交次序串行化（详见函数文档）
+                _lock_parent_chain_share(conn, cert_no)
+                lifted = conn.execute(
+                    """
+                    UPDATE cert_suspensions
+                    SET lifted_at = now(), lift_reason = %s
+                    WHERE suspension_id = %s AND lifted_at IS NULL
+                    RETURNING """ + _SUSPENSION_COLS,
+                    (reason, active["suspension_id"]),
+                ).fetchone()
+                if lifted is None:
+                    # 并发解除已抢先提交：整体回滚，按“无生效停用”判冲突
+                    raise ApiError(
+                        409,
+                        "suspension_not_active",
+                        f"证书 {cert_no} 的停用已被并发解除（不能重复解除）",
+                        details={"cert_no": cert_no},
+                    )
+            body = _suspension_view(conn, cert_no)
+            body["lift"] = _suspension_event(lifted)[1]
+            return body
+        except ApiError:
+            raise
+        except psycopg.errors.DeadlockDetected:
+            if attempt == 2:
+                raise ApiError(
+                    409,
+                    "suspension_busy",
+                    f"证书 {cert_no} 的停用解除与并发签发/撤销竞争，重试后仍冲突，请稍后重试",
+                    details={"cert_no": cert_no},
+                )
+
+
+def get_certificate_suspension(conn, cert_no: str, management_key: str | None) -> dict:
+    """查询证书的当前停用状态与历次停用/解除的时间和原因（须凭管理密钥）。
+
+    证书不存在 → 404 cert_not_found；密钥缺失/错误 → 401。
+    从无停用记录的证书同样可查：currently_suspended=false、active=null、
+    history=[]，证书内容为当前真实内容（撤销/失效仍如实展示）。
+    """
+    _require_management_key(management_key)
+    return _suspension_view(conn, cert_no)
 
 
 # ---------------------------------------------------------------------------
